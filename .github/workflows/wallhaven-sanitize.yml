@@ -7,7 +7,7 @@ name: Temporary Wallhaven sanitizer
       - .github/workflows/wallhaven-sanitize.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sanitize:
@@ -206,3 +206,22 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+
+      - name: Record run identifier
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '{"run_id":%s,"run_number":%s,"run_attempt":%s,"job_status":"%s","head_sha":"%s"}\n' \
+            "${{ github.run_id }}" \
+            "${{ github.run_number }}" \
+            "${{ github.run_attempt }}" \
+            "${{ job.status }}" \
+            "${{ github.sha }}" \
+            > .wallhaven-run.json
+          git add .wallhaven-run.json
+          git commit -m "Record temporary wallpaper sanitization run ${{ github.run_id }}"
+          git pull --rebase origin main
+          git push origin HEAD:main

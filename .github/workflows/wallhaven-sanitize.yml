@@ -1,0 +1,208 @@
+name: Temporary Wallhaven sanitizer
+
+'on':
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/wallhaven-sanitize.yml
+
+permissions:
+  contents: read
+
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install scanners
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clamav libimage-exiftool-perl python3-pil
+          sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
+          for n in 1 2 3; do
+            sudo freshclam --stdout && break
+            [ "$n" -lt 3 ] || exit 1
+            sleep 20
+          done
+
+      - name: Retrieve and sanitize originals
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p out source meta
+          python3 <<'PY'
+          from __future__ import annotations
+          import hashlib, json, time, urllib.request
+          from pathlib import Path
+          from PIL import Image, ImageOps
+
+          Image.MAX_IMAGE_PIXELS = 250_000_000
+          items = {
+              "3qqdg6": "https://raw.githubusercontent.com/SirineZanina/wallpapers/main/wallhaven-3qqdg6.jpg",
+              "7jeozo": "https://raw.githubusercontent.com/snowarch/iNiR-Walls/main/images/wallhaven-7jeozo.jpg",
+          }
+          headers = {"User-Agent": "wallpaper-sanitizer/1.0"}
+
+          def get(url: str) -> bytes:
+              error = None
+              for n in range(4):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          return r.read()
+                  except Exception as exc:
+                      error = exc
+                      time.sleep(min(20, 2 ** (n + 1)))
+              raise RuntimeError(f"download failed: {url}: {error}")
+
+          def sha256(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          reports = []
+          for wid, fallback in items.items():
+              api_url = f"https://wallhaven.cc/api/v1/w/{wid}"
+              api = {}
+              chosen = fallback
+              method = "public full-resolution mirror fallback"
+              try:
+                  api_raw = get(api_url)
+                  Path(f"meta/{wid}.json").write_bytes(api_raw)
+                  api = json.loads(api_raw.decode("utf-8")).get("data", {})
+                  original_url = str(api.get("path", ""))
+                  if original_url:
+                      try:
+                          source_bytes = get(original_url)
+                          chosen = original_url
+                          method = "Wallhaven API original path"
+                      except Exception:
+                          source_bytes = get(fallback)
+                  else:
+                      source_bytes = get(fallback)
+              except Exception:
+                  source_bytes = get(fallback)
+
+              source_path = Path(f"source/wallhaven-{wid}.jpg")
+              clean_path = Path(f"out/wallhaven-{wid}-clean.jpg")
+              source_path.write_bytes(source_bytes)
+              if not source_bytes.startswith(b"\xff\xd8\xff"):
+                  raise RuntimeError(f"{wid}: source is not JPEG")
+
+              with Image.open(source_path) as probe:
+                  probe.load()
+                  if probe.format != "JPEG":
+                      raise RuntimeError(f"{wid}: Pillow format is {probe.format}")
+                  source_size = probe.size
+                  source_mode = probe.mode
+                  source_info = sorted(probe.info)
+
+              expected = (int(api.get("dimension_x", 0) or 0), int(api.get("dimension_y", 0) or 0))
+              if all(expected) and expected != source_size:
+                  raise RuntimeError(f"{wid}: {source_size} does not match API {expected}")
+
+              with Image.open(source_path) as image:
+                  image.load()
+                  image = ImageOps.exif_transpose(image)
+                  if image.mode not in ("RGB", "L"):
+                      image = image.convert("RGB")
+                  else:
+                      image = image.copy()
+                  image.save(clean_path, "JPEG", quality=100, subsampling=0, optimize=True, progressive=False)
+
+              with Image.open(clean_path) as clean:
+                  clean.load()
+                  clean_size = clean.size
+                  clean_info = sorted(clean.info)
+              if clean_size != source_size:
+                  raise RuntimeError(f"{wid}: clean dimensions changed from {source_size} to {clean_size}")
+
+              clean_bytes = clean_path.read_bytes()
+              if not clean_bytes.endswith(b"\xff\xd9"):
+                  raise RuntimeError(f"{wid}: clean JPEG has data after/missing EOI")
+
+              forbidden = []
+              labels = {0xE1:"APP1", 0xE2:"APP2", 0xED:"APP13", 0xFE:"COM"}
+              i = 2
+              while i + 1 < len(clean_bytes):
+                  if clean_bytes[i] != 0xFF:
+                      i += 1; continue
+                  while i < len(clean_bytes) and clean_bytes[i] == 0xFF:
+                      i += 1
+                  if i >= len(clean_bytes): break
+                  marker = clean_bytes[i]; i += 1
+                  if marker == 0xDA: break
+                  if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7: continue
+                  length = int.from_bytes(clean_bytes[i:i+2], "big")
+                  if length < 2 or i + length > len(clean_bytes):
+                      raise RuntimeError(f"{wid}: invalid JPEG segment")
+                  if marker in labels: forbidden.append(labels[marker])
+                  i += length
+              if forbidden:
+                  raise RuntimeError(f"{wid}: metadata markers remain: {forbidden}")
+
+              reports.append({
+                  "id": wid,
+                  "download_method": method,
+                  "download_url": chosen,
+                  "source_dimensions": list(source_size),
+                  "source_mode": source_mode,
+                  "source_info_keys": source_info,
+                  "source_size_bytes": len(source_bytes),
+                  "source_sha256": sha256(source_bytes),
+                  "clean_dimensions": list(clean_size),
+                  "clean_info_keys": clean_info,
+                  "clean_size_bytes": len(clean_bytes),
+                  "clean_sha256": sha256(clean_bytes),
+                  "forbidden_metadata_markers": forbidden,
+                  "ends_exactly_at_jpeg_eoi": True,
+              })
+
+          Path("meta/sanitization.json").write_text(json.dumps(reports, indent=2) + "\n", encoding="utf-8")
+          PY
+          file source/*.jpg out/*.jpg | tee meta/file-types.txt
+          exiftool -a -G1 -s out/*.jpg > meta/exiftool-clean.txt
+          sha256sum out/*.jpg > meta/clean-sha256.txt
+
+      - name: Malware scan
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          clamscan --version | tee meta/clamav-version.txt
+          set +e
+          clamscan --recursive source out | tee meta/clamav-scan.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          [ "$status" -eq 0 ] || exit "$status"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "WALLHAVEN CLEAN IMAGE VERIFICATION REPORT"
+            echo "Generated UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            echo "Each original was fully decoded and re-encoded at identical pixel dimensions as JPEG quality 100 / 4:4:4."
+            echo "No EXIF, XMP, IPTC, ICC, Photoshop, or comment segments were copied."
+            echo "Outputs were structurally validated and scanned by ClamAV with freshly updated signatures."
+            echo
+            cat meta/sanitization.json
+            echo
+            cat meta/clamav-version.txt
+            cat meta/clamav-scan.txt
+            echo
+            cat meta/exiftool-clean.txt
+          } > out/verification-report.txt
+          (cd out && zip -9 wallhaven-cleaned-max-resolution.zip wallhaven-3qqdg6-clean.jpg wallhaven-7jeozo-clean.jpg verification-report.txt)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallhaven-cleaned-max-resolution
+          path: out/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
